@@ -34,24 +34,31 @@
 
 typedef struct {
     const AVClass *class;
-    int first_field;
-    char *pattern;
-    int start_frame;
-    int init_len;
-    unsigned int pattern_pos;
-    unsigned int nskip_fields;
-    int64_t start_time;
+    int first_field;            ///< 0 = top first field, 1 = bottom first field.
+    char *pattern;              /**< The telecine pattern representing the original
+                                     frames -> fields mapping. */
+    int start_frame;            /**< Describes the input frame position offset
+                                     into pattern. */
+    int init_len;               /**< Number of stray fields at the beginning
+                                     resulting from a cut. */
+    unsigned int pattern_pos;   ///< The current position within pattern.
+    unsigned int nskip_fields;  /**< Number of fields from input to skip writing
+                                      to the output. */
+    int64_t start_time;         ///< The PTS value of the first frame.
 
-    AVRational pts;
-    AVRational ts_unit;
-    int occupied;
+    AVRational pts;             ///< PTS multiplier, telecined frames/detelecined frames.
+    AVRational ts_unit;         ///< Timestamp interval of one output frame.
+    int occupied;               ///< Boolean, indicates whether temp has data in it.
 
-    int nb_planes;
-    int planeheight[4];
-    int stride[4];
+    int nb_planes;              ///< The number of planes in the video format.
+    int planeheight[4];         /**< The height of each plane in nb_planes from the
+                                     video context. */
+    int stride[4];              /**< The number of bytes in one row of data for each
+                                     plane in nb_planes. */
 
-    AVFrame *frame[2];
-    AVFrame *temp;
+    AVFrame *frame[2];          ///< Detelecined output frames.
+    AVFrame *temp;              /**< Buffered frame needed to contribute fields to the
+                                     next output frame. */
 } DetelecineContext;
 
 #define OFFSET(x) offsetof(DetelecineContext, x)
@@ -73,9 +80,9 @@ AVFILTER_DEFINE_CLASS(detelecine);
 static av_cold int init(AVFilterContext *ctx)
 {
     DetelecineContext *s = ctx->priv;
-    const char *p;
-    int max = 0;
-    int sum = 0;
+    const char *p; ///< Induction variable for loops.
+    int max = 0;   ///< Max of the field values in pattern.
+    int sum = 0;   ///< Sum of the field values in pattern.
 
     if (!strlen(s->pattern)) {
         av_log(ctx, AV_LOG_ERROR, "No pattern provided.\n");
@@ -105,6 +112,11 @@ static av_cold int init(AVFilterContext *ctx)
     s->init_len = 0;
 
     if (s->start_frame != 0) {
+        /**
+         *  Calculates the number of residual frames as the result of a cut so the
+         *  pattern will begin at the proper position while accounting for any
+         *  residual frames from the previous number in the pattern.
+         */
         int nfields = 0;
         for (p = s->pattern; *p; p++) {
             nfields += *p - '0';
@@ -129,6 +141,7 @@ static int query_formats(AVFilterContext *ctx)
 
     for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
+        // Skip over formats which pack data unconventionally.
         if (!(desc->flags & AV_PIX_FMT_FLAG_HWACCEL ||
               desc->flags & AV_PIX_FMT_FLAG_PAL     ||
               desc->flags & AV_PIX_FMT_FLAG_BITSTREAM) &&
@@ -199,7 +212,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
     AVFilterContext *ctx = inlink->dst;
     AVFilterLink *outlink = ctx->outputs[0];
     DetelecineContext *s = ctx->priv;
-    int i, len = 0, ret = 0, out = 0;
+    int i; //< For loop inductive variable.
+    int len = 0; ///< Number of fields the current output frame spans.
+    int ret = 0; ///< The result of the next filter in the filtergraph.
+    int out = 0; ///< Number of output frames.
 
     if (s->start_time == AV_NOPTS_VALUE)
         s->start_time = inpicref->pts;
@@ -208,6 +224,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
         s->nskip_fields -= 2;
         return 0;
     } else if (s->nskip_fields >= 1) {
+        // One of the fields from the current frame will be needed.
         for (i = 0; i < s->nb_planes; i++) {
             av_image_copy_plane(s->temp->data[i], s->temp->linesize[i],
                                 inpicref->data[i], inpicref->linesize[i],
@@ -220,6 +237,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
     }
 
     if (s->nskip_fields == 0) {
+        /**
+         *  init_len may only not be zero during the first time filter_frame
+         *  is called.
+         */
         len = s->init_len;
         s->init_len = 0;
         while(!len && s->pattern[s->pattern_pos]) {
@@ -230,20 +251,27 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
         if (!s->pattern[s->pattern_pos])
             s->pattern_pos = 0;
 
-        if(!len) { // do not output any field as the entire pattern is zero
+        if(!len) { // Do not output any field as the entire pattern is zero.
             av_frame_free(&inpicref);
             return 0;
         }
 
         if (len == 1 && s->occupied) {
+            /**
+             *  The pattern describes an output frame of one field and a frame is
+             *  buffered. Copy the frame entirely to the output despite the
+             *  possibility it may be interlaced to maintain a consistent frame
+             *  size.
+             */
             s->occupied = 0;
-            // output THIS image as-is
+            // Output THIS input frame as-is.
             for (i = 0; i < s->nb_planes; i++)
                 av_image_copy_plane(s->frame[out]->data[i], s->frame[out]->linesize[i],
                                     s->temp->data[i], s->temp->linesize[i],
                                     s->stride[i],
                                     s->planeheight[i]);
             len = 0;
+            // Two fields in input frame, only handled the first.
             while(!len && s->pattern[s->pattern_pos]) {
                 len = s->pattern[s->pattern_pos] - '0';
                 s->pattern_pos++;
@@ -258,14 +286,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
 
         if (s->occupied) {
             for (i = 0; i < s->nb_planes; i++) {
-                // fill in the EARLIER field from the new pic
+                // Fill in the EARLIER field from the new input frame.
                 av_image_copy_plane(s->frame[out]->data[i] + s->frame[out]->linesize[i] * s->first_field,
                                     s->frame[out]->linesize[i] * 2,
                                     inpicref->data[i] + inpicref->linesize[i] * s->first_field,
                                     inpicref->linesize[i] * 2,
                                     s->stride[i],
                                     (s->planeheight[i] - s->first_field + 1) / 2);
-                // fill in the LATER field from the buffered pic
+                // Fill in the LATER field from the buffered frame.
                 av_image_copy_plane(s->frame[out]->data[i] + s->frame[out]->linesize[i] * !s->first_field,
                                     s->frame[out]->linesize[i] * 2,
                                     s->temp->data[i] + s->temp->linesize[i] * !s->first_field,
@@ -276,6 +304,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
 
             s->occupied = 0;
             if (len <= 2) {
+                /**
+                 *  The output frame was two fields and the second field came from
+                 *  this input frame. This input frame has one field which belongs
+                 *  to the next output frame.
+                 */
                 for (i = 0; i < s->nb_planes; i++) {
                     av_image_copy_plane(s->temp->data[i], s->temp->linesize[i],
                                         inpicref->data[i], inpicref->linesize[i],
@@ -285,25 +318,43 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
                 s->occupied = 1;
             }
             ++out;
+            /**
+             *  This input frame completed an output frame, a len longer than
+             *  three signifies there are additional input frames which contain
+             *  the same fields as this completed output frame. Subtract three
+             *  to get the number of fields  to skip (nskip_fields) in order to
+             *  avoid treating those input frames as new data.
+            */
             len = (len >= 3) ? len - 3 : 0;
         } else {
             if (len >= 2) {
-                // output THIS image as-is
+                // Output THIS input frame as-is.
                 for (i = 0; i < s->nb_planes; i++)
                     av_image_copy_plane(s->frame[out]->data[i], s->frame[out]->linesize[i],
                                         inpicref->data[i], inpicref->linesize[i],
                                         s->stride[i],
                                         s->planeheight[i]);
+                /**
+                 *  Any number of fields representing this output frame which
+                 *  is greater than two results in duplicate input frames of
+                 *  the same fields. Skip len - 2 to avoid outputting frames
+                 *  from the same fields.
+                 */
                 len -= 2;
                 ++out;
             } else if (len == 1) {
-                // output THIS image as-is
+                /**
+                 *  Copy the frame entirely to the output despite the
+                 *  possibility it may be interlaced to maintain a consistent
+                 *  frame size. Buffer the frame because the second field is
+                 *  part of the next output frame.
+                 */
+                // Output THIS input frame as-is.
                 for (i = 0; i < s->nb_planes; i++)
                     av_image_copy_plane(s->frame[out]->data[i], s->frame[out]->linesize[i],
                                         inpicref->data[i], inpicref->linesize[i],
                                         s->stride[i],
                                         s->planeheight[i]);
-
                 for (i = 0; i < s->nb_planes; i++) {
                     av_image_copy_plane(s->temp->data[i], s->temp->linesize[i],
                                         inpicref->data[i], inpicref->linesize[i],
@@ -323,6 +374,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inpicref)
             s->occupied = 0;
         }
     }
+
+    /**
+     *  len > 0 indicates additional fields with duplicate data, skip that
+     *  number of fields.
+     */
     s->nskip_fields = len;
 
     for (i = 0; i < out; ++i) {
@@ -349,6 +405,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 {
     DetelecineContext *s = ctx->priv;
 
+    // Cleanup frames allocated in config_input.
     av_frame_free(&s->temp);
     av_frame_free(&s->frame[0]);
     av_frame_free(&s->frame[1]);
